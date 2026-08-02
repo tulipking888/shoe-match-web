@@ -1,13 +1,19 @@
 'use strict';
 
 const DB_NAME = 'shoe-match-db';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const SAMPLE_STORE = 'shoes';
 const BATCH_STORE = 'importBatches';
+const FEATURE_VERSION = 'dinov2-small-int8-cls-v1';
+const MODEL_URL = './models/dinov2-small/model_quantized.onnx';
+const MODEL_DIMENSION = 384;
+const MODEL_INPUT_SIZE = 224;
+const MODEL_RESIZE_SHORT = 256;
 let db;
 let stockFile = null;
 let excelFile = null;
 let queryToken = 0;
+let modelSessionPromise = null;
 
 const $ = s => document.querySelector(s);
 const sleepFrame = () => new Promise(r => requestAnimationFrame(r));
@@ -55,8 +61,10 @@ function formatBytes(bytes){if(!Number.isFinite(bytes))return '-';if(bytes<1024)
 function loadImage(fileOrUrl){
   return new Promise((resolve,reject)=>{
     const img=new Image();
-    img.onload=()=>resolve(img); img.onerror=reject;
-    img.src=typeof fileOrUrl==='string'?fileOrUrl:URL.createObjectURL(fileOrUrl);
+    const objectUrl=typeof fileOrUrl==='string'?null:URL.createObjectURL(fileOrUrl);
+    img.onload=()=>{if(objectUrl)URL.revokeObjectURL(objectUrl);resolve(img)};
+    img.onerror=e=>{if(objectUrl)URL.revokeObjectURL(objectUrl);reject(e)};
+    img.src=objectUrl||fileOrUrl;
   });
 }
 function drawCover(img,size=256){
@@ -66,28 +74,66 @@ function drawCover(img,size=256){
   ctx.drawImage(img,(size-w)/2,(size-h)/2,w,h); return c;
 }
 function makeThumb(img){return drawCover(img,420).toDataURL('image/jpeg',0.76)}
-function grayAt(data,i){return data[i]*.299+data[i+1]*.587+data[i+2]*.114}
-function extractFeatures(img){
-  const hc=document.createElement('canvas');hc.width=17;hc.height=16;
-  const hctx=hc.getContext('2d',{willReadFrequently:true});const cover=drawCover(img,256);hctx.drawImage(cover,0,0,17,16);
-  const hd=hctx.getImageData(0,0,17,16).data;let bits='';
-  for(let y=0;y<16;y++)for(let x=0;x<16;x++)bits+=grayAt(hd,(y*17+x)*4)>grayAt(hd,(y*17+x+1)*4)?'1':'0';
-  let hash='';for(let i=0;i<bits.length;i+=4)hash+=parseInt(bits.slice(i,i+4),2).toString(16);
-  const c=document.createElement('canvas');c.width=c.height=64;const ctx=c.getContext('2d',{willReadFrequently:true});ctx.drawImage(cover,0,0,64,64);
-  const d=ctx.getImageData(0,0,64,64).data,color=new Array(24).fill(0),gray=new Float32Array(4096);
-  for(let p=0,j=0;p<d.length;p+=4,j++){color[Math.min(7,d[p]>>5)]++;color[8+Math.min(7,d[p+1]>>5)]++;color[16+Math.min(7,d[p+2]>>5)]++;gray[j]=grayAt(d,p)}
-  for(let i=0;i<24;i++)color[i]/=4096;
-  const edge=new Array(8).fill(0);let edgeSum=0;
-  for(let y=1;y<63;y++)for(let x=1;x<63;x++){const i=y*64+x,gx=-gray[i-65]+gray[i-63]-2*gray[i-1]+2*gray[i+1]-gray[i+63]+gray[i+65],gy=-gray[i-65]-2*gray[i-64]-gray[i-63]+gray[i+63]+2*gray[i+64]+gray[i+65],mag=Math.hypot(gx,gy);if(mag<35)continue;const bin=Math.floor((Math.atan2(gy,gx)+Math.PI)/(2*Math.PI)*8)%8;edge[bin]+=mag;edgeSum+=mag}
-  if(edgeSum)for(let i=0;i<8;i++)edge[i]/=edgeSum;
-  return {hash,color,edge};
+function setModelStatus(text,state='idle'){
+  const el=$('#modelStatus');
+  if(!el)return;
+  el.textContent=text;
+  el.dataset.state=state;
 }
-function popcntHex(a,b){let diff=0;const t=[0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4];for(let i=0;i<Math.min(a.length,b.length);i++)diff+=t[parseInt(a[i],16)^parseInt(b[i],16)];return diff}
-function cosine(a,b){let dot=0,aa=0,bb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];aa+=a[i]*a[i];bb+=b[i]*b[i]}return dot/(Math.sqrt(aa*bb)||1)}
-function similarity(q,s){const hs=1-popcntHex(q.hash,s.hash)/256,cs=Math.max(0,cosine(q.color,s.color)),es=Math.max(0,cosine(q.edge,s.edge));return Math.max(0,Math.min(1,hs*.58+cs*.27+es*.15))}
-async function featuresFromFile(file){const img=await loadImage(file);return {img,features:extractFeatures(img),thumb:makeThumb(img)}}
+async function ensureModel(statusEl){
+  if(modelSessionPromise)return modelSessionPromise;
+  if(!window.ort)throw Error('AI 运行库未加载，请刷新页面重试');
+  setModelStatus('AI 模型加载中…','loading');
+  if(statusEl)setStatus(statusEl,'首次使用正在加载本地 AI 模型（约 24 MB），后续会自动缓存…');
+  const base=new URL('./vendor/onnxruntime/',location.href).href;
+  ort.env.wasm.wasmPaths=base;
+  ort.env.wasm.numThreads=1;
+  // GitHub Pages does not provide cross-origin isolation. Keep the portable
+  // single-thread WASM backend; yielding between samples keeps import progress visible.
+  ort.env.wasm.proxy=false;
+  modelSessionPromise=ort.InferenceSession.create(MODEL_URL,{executionProviders:['wasm'],graphOptimizationLevel:'all'})
+    .then(session=>{setModelStatus('AI 模型已就绪','ready');return session})
+    .catch(error=>{modelSessionPromise=null;setModelStatus('AI 模型加载失败','error');throw error});
+  return modelSessionPromise;
+}
+function modelInputFromImage(img){
+  const canvas=document.createElement('canvas');canvas.width=canvas.height=MODEL_INPUT_SIZE;
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff';ctx.fillRect(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE);
+  const scale=MODEL_RESIZE_SHORT/Math.min(img.width,img.height),w=img.width*scale,h=img.height*scale;
+  ctx.drawImage(img,(MODEL_INPUT_SIZE-w)/2,(MODEL_INPUT_SIZE-h)/2,w,h);
+  const rgba=ctx.getImageData(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE).data;
+  const plane=MODEL_INPUT_SIZE*MODEL_INPUT_SIZE,input=new Float32Array(plane*3);
+  const means=[.485,.456,.406],stds=[.229,.224,.225];
+  for(let p=0,i=0;i<plane;i++,p+=4){input[i]=(rgba[p]/255-means[0])/stds[0];input[plane+i]=(rgba[p+1]/255-means[1])/stds[1];input[plane*2+i]=(rgba[p+2]/255-means[2])/stds[2]}
+  return input;
+}
+async function embeddingFromImage(img,statusEl){
+  const session=await ensureModel(statusEl),input=modelInputFromImage(img);
+  const outputs=await session.run({pixel_values:new ort.Tensor('float32',input,[1,3,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE])});
+  const tensor=outputs.last_hidden_state||Object.values(outputs)[0];
+  if(!tensor||tensor.data.length<MODEL_DIMENSION)throw Error('AI 模型输出格式不正确');
+  const embedding=new Array(MODEL_DIMENSION);let norm=0;
+  for(let i=0;i<MODEL_DIMENSION;i++){const v=Number(tensor.data[i]);embedding[i]=v;norm+=v*v}
+  norm=Math.sqrt(norm)||1;
+  for(let i=0;i<MODEL_DIMENSION;i++)embedding[i]/=norm;
+  return embedding;
+}
+function embeddingSimilarity(a,b){
+  if(!a||!b||a.length!==MODEL_DIMENSION||b.length!==MODEL_DIMENSION)return -1;
+  let dot=0;for(let i=0;i<MODEL_DIMENSION;i++)dot+=Number(a[i])*Number(b[i]);
+  return Math.max(0,Math.min(1,dot));
+}
+async function featuresFromFile(file,statusEl){const img=await loadImage(file),embedding=await embeddingFromImage(img,statusEl);return {img,embedding,featureVersion:FEATURE_VERSION,thumb:makeThumb(img)}}
 function showPreview(file,el){el.src=URL.createObjectURL(file);el.classList.remove('hidden')}
-async function refreshCount(){$('#dbCount').textContent=`${await countAll()} 条`;await refreshStorage()}
+async function refreshCount(){
+  const total=await countAll();$('#dbCount').textContent=`${total} 条`;
+  const all=total?await getAllSamples():[],searchable=all.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION).length;
+  if(searchable)setModelStatus(`AI 向量 ${searchable} 条`,'ready');
+  else if(total)setModelStatus('旧版数据需重新导入','warning');
+  else setModelStatus('AI 模型按需加载','idle');
+  await refreshStorage();
+}
 async function refreshStorage(){
   const el=$('#storageUsage');if(!el)return;
   try{const est=await navigator.storage?.estimate?.();el.textContent=est?`浏览器存储：已用 ${formatBytes(est.usage)} / 配额 ${formatBytes(est.quota)}`:'浏览器未提供存储估算';}
@@ -106,7 +152,7 @@ function renderResults(items){
     resultImg.onclick=()=>openImageModal(x.thumb);n.querySelector('.result-code').textContent=`样品编号：${x.code||'未填写'}`;
     const meta=[];if(x.sendDate)meta.push(['寄出时间',x.sendDate]);if(x.customerNo)meta.push(['客户编号',x.customerNo]);if(x.orderNo)meta.push(['订单编号',x.orderNo]);if(x.remark)meta.push(['特别要求',x.remark]);
     n.querySelector('.meta-list').innerHTML=meta.length?meta.map(([k,v])=>`<p><b>${esc(k)}：</b>${esc(v)}</p>`).join(''):'<p class="muted">无其他资料</p>';
-    const pct=Math.round(x.score*1000)/10;n.querySelector('.result-score').textContent=`${pct}%`;n.querySelector('.score-bar i').style.width=`${pct}%`;root.appendChild(n);
+    const pct=Math.round(x.score*1000)/10;n.querySelector('.result-score').textContent=`${pct} / 100`;n.querySelector('.score-bar i').style.width=`${pct}%`;root.appendChild(n);
   });
 }
 async function handleQuery(file){
@@ -117,25 +163,32 @@ async function handleQuery(file){
   setStatus(status,'正在处理当前查询图片…');
   const start=performance.now();
   try{
-    const {features}=await featuresFromFile(file);
+    const img=await loadImage(file),embedding=await embeddingFromImage(img,status);
     if(token!==queryToken)return;
-    const all=(await getAllSamples()).filter(x=>x.features);
-    setStatus(status,`正在比对 ${all.length} 条记录…`);
+    const stored=await getAllSamples(),all=stored.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION);
+    if(!all.length){
+      if(stored.length)throw Error('现有数据库是旧版特征，请在“批量与管理”中清空后重新导入 Excel');
+      throw Error('数据库暂无样品，请先导入 Excel');
+    }
+    setStatus(status,`正在比对 ${all.length} 条 AI 向量…`);
     await sleepFrame();
-    const scored=[];
+    const bestByCode=new Map();
     for(let i=0;i<all.length;i++){
       if(token!==queryToken)return;
       const s=normalizedRecord(all[i]);
-      scored.push({...s,score:similarity(features,s.features)});
+      const item={...s,score:embeddingSimilarity(embedding,s.embedding)},key=s.code.trim().toLocaleLowerCase()||`__${s.id}`;
+      if(!bestByCode.has(key)||item.score>bestByCode.get(key).score)bestByCode.set(key,item);
       if(i&&i%300===0)await sleepFrame();
     }
+    const scored=[...bestByCode.values()];
     scored.sort((a,b)=>b.score-a.score);
     if(token!==queryToken)return;
     renderResults(scored.slice(0,5));
-    setStatus(status,`完成：比对 ${all.length} 条，耗时 ${Math.round(performance.now()-start)} ms。`);
+    const top=scored[0]?.code?`第一名：${scored[0].code}。`:'';
+    setStatus(status,`完成：比对 ${all.length} 条、合并为 ${scored.length} 个编号，耗时 ${Math.round(performance.now()-start)} ms。${top}`);
   }catch(e){
     console.error(e);
-    setStatus(status,'识别失败，请换一张图片重试。',true);
+    setStatus(status,e.message||'识别失败，请换一张图片重试。',true);
   }
 }
 function openImageModal(src){
@@ -183,7 +236,7 @@ async function parseExcelPackage(file){
 function pick(obj,names,candidates){for(const name of candidates){const idx=names[name];if(idx!==undefined)return obj[idx]??''}return ''}
 
 async function findDuplicateBatch(file){
-  const fp=fileFingerprint(file);return (await getAllBatches()).filter(x=>x.fingerprint===fp&&x.status!=='deleted').sort((a,b)=>b.startedAt-a.startedAt)[0];
+  const fp=fileFingerprint(file);return (await getAllBatches()).filter(x=>x.fingerprint===fp&&x.status==='completed'&&(x.successCount||0)>0).sort((a,b)=>b.startedAt-a.startedAt)[0];
 }
 async function deleteBatchData(batchIdToDelete){
   return new Promise((resolve,reject)=>{
@@ -225,23 +278,24 @@ async function importExcel(file){
     if(!again)return;
   }
   const id=batchId(),startedAt=Date.now(),fingerprint=fileFingerprint(file);
-  const btn=$('#excelImportBtn'),status=$('#excelStatus'),wrap=$('#excelProgressWrap'),bar=$('#excelProgressBar'),txt=$('#excelProgressText');btn.disabled=true;wrap.classList.remove('hidden');bar.style.width='0%';setStatus(status,'正在解析 Excel，请勿关闭页面…');
+  const btn=$('#excelImportBtn'),status=$('#excelStatus'),wrap=$('#excelProgressWrap'),bar=$('#excelProgressBar'),txt=$('#excelProgressText');btn.disabled=true;wrap.classList.remove('hidden');bar.style.width='0%';setStatus(status,'正在准备 AI 模型…');
   let success=0,failed=0,total=0;const failures=[];
   let batch={batchId:id,fileName:file.name,fileSize:file.size,fingerprint,startedAt,status:'processing',totalCount:0,successCount:0,failedCount:0,failures:[]};await putBatch(batch);
   try{
+    await ensureModel(status);setStatus(status,'正在解析 Excel 并计算 AI 向量，请勿关闭页面…');
     const {zip,rows,names,imagesByRow}=await parseExcelPackage(file);const candidates=rows.filter(r=>String(pick(r,names,['样品编号','鞋子编号','编号'])).trim()||imagesByRow.has(r._row));total=candidates.length;batch.totalCount=total;await putBatch(batch);
     for(let i=0;i<candidates.length;i++){
       const r=candidates[i],code=String(pick(r,names,['样品编号','鞋子编号','编号'])).trim(),mediaPath=imagesByRow.get(r._row);
       try{
-        if(!code)throw Error('样品编号为空');if(!mediaPath)throw Error('缺少内嵌图片');const zf=zip.file(mediaPath);if(!zf)throw Error('找不到图片文件');const blob=await zf.async('blob');const {features,thumb}=await featuresFromFile(blob);
-        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,features,source:'excel',sourceFile:file.name,sourceRow:r._row,batchId:id,createdAt:Date.now()});success++;
+        if(!code)throw Error('样品编号为空');if(!mediaPath)throw Error('缺少内嵌图片');const zf=zip.file(mediaPath);if(!zf)throw Error('找不到图片文件');const blob=await zf.async('blob');const {embedding,featureVersion,thumb}=await featuresFromFile(blob);
+        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,embedding,featureVersion,source:'excel',sourceFile:file.name,sourceRow:r._row,batchId:id,createdAt:Date.now()});success++;
       }catch(e){failed++;failures.push({row:r._row,code,error:e.message||String(e)});console.warn('导入行失败',r._row,e)}
-      const pct=Math.round((i+1)/candidates.length*100);bar.style.width=`${pct}%`;txt.textContent=`${i+1} / ${candidates.length} · 成功 ${success} · 失败 ${failed}`;
+      const pct=Math.round((i+1)/candidates.length*100);bar.style.width=`${pct}%`;txt.textContent=`${i+1} / ${candidates.length} · AI 向量成功 ${success} · 失败 ${failed}`;
       if(i%3===0){await sleepFrame();await wait(5)}
       if(i%25===0){batch={...batch,totalCount:total,successCount:success,failedCount:failed,failures,status:'processing'};await putBatch(batch)}
     }
     batch={...batch,finishedAt:Date.now(),status:'completed',totalCount:total,successCount:success,failedCount:failed,failures};await putBatch(batch);
-    await refreshCount();await renderBatches();setStatus(status,`导入完成：成功 ${success} 条，失败 ${failed} 条。相同编号已全部保留。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
+    await refreshCount();await renderBatches();setStatus(status,`AI 向量导入完成：成功 ${success} 条，失败 ${failed} 条。相同编号会在查询结果中自动合并。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
   }catch(e){
     console.error(e);batch={...batch,finishedAt:Date.now(),status:'failed',totalCount:total,successCount:success,failedCount:failed||1,failures:[...failures,{row:null,error:e.message||'文件结构无法识别'}]};await putBatch(batch);await renderBatches();setStatus(status,`Excel 导入失败：${e.message||'文件结构无法识别'}`,true);
   }finally{btn.disabled=false}
@@ -270,10 +324,10 @@ function initUI(){
   document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));btn.classList.add('active');$('#'+btn.dataset.tab).classList.add('active');if(btn.dataset.tab==='manage')renderBatches()});
   bindQuery($('#queryCameraInput'));bindQuery($('#queryFileInput'));
   $('#stockInput').onchange=e=>{stockFile=e.target.files[0]||null;if(stockFile)showPreview(stockFile,$('#stockPreview'))};
-  $('#addForm').onsubmit=async e=>{e.preventDefault();if(!stockFile)return;const btn=$('#saveBtn'),status=$('#addStatus');btn.disabled=true;btn.textContent='正在处理…';try{const {features,thumb}=await featuresFromFile(stockFile);await addSample({code:$('#shoeCode').value.trim(),customerNo:'',orderNo:'',sendDate:'',remark:'',thumb,features,source:'manual',batchId:null,createdAt:Date.now()});setStatus(status,'保存成功；编号重复也会作为独立记录保留。');e.target.reset();stockFile=null;$('#stockPreview').classList.add('hidden');await refreshCount()}catch(err){console.error(err);setStatus(status,'保存失败，可能是浏览器存储空间不足。',true)}finally{btn.disabled=false;btn.textContent='计算特征并保存'}};
+  $('#addForm').onsubmit=async e=>{e.preventDefault();if(!stockFile)return;const btn=$('#saveBtn'),status=$('#addStatus');btn.disabled=true;btn.textContent='正在计算 AI 向量…';try{const {embedding,featureVersion,thumb}=await featuresFromFile(stockFile,status);await addSample({code:$('#shoeCode').value.trim(),customerNo:'',orderNo:'',sendDate:'',remark:'',thumb,embedding,featureVersion,source:'manual',batchId:null,createdAt:Date.now()});setStatus(status,'保存成功；同编号的多张图片会在查询时自动合并。');e.target.reset();stockFile=null;$('#stockPreview').classList.add('hidden');await refreshCount()}catch(err){console.error(err);setStatus(status,`保存失败：${err.message||'浏览器存储空间不足'}`,true)}finally{btn.disabled=false;btn.textContent='计算 AI 向量并保存'}};
   $('#excelInput').onchange=e=>{excelFile=e.target.files[0]||null;$('#excelFileName').textContent=excelFile?`${excelFile.name} · ${(excelFile.size/1024/1024).toFixed(1)} MB`:'';$('#excelImportBtn').disabled=!excelFile};
   $('#excelImportBtn').onclick=()=>excelFile&&importExcel(excelFile);
-  $('#exportBtn').onclick=async()=>{const all=await getAllSamples(),batches=await getAllBatches();downloadJSON(`sample-backup-${new Date().toISOString().slice(0,10)}.json`,{version:3,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出 ${all.length} 条样品及批次记录。`)};
+  $('#exportBtn').onclick=async()=>{const all=await getAllSamples(),batches=await getAllBatches();downloadJSON(`sample-backup-${new Date().toISOString().slice(0,10)}.json`,{version:4,featureVersion:FEATURE_VERSION,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出 ${all.length} 条样品、AI 向量及批次记录。`)};
   $('#importInput').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const count=await importBackup(f);await refreshCount();await renderBatches();setStatus($('#manageStatus'),`成功导入 ${count} 条备份数据。`)}catch(err){console.error(err);setStatus($('#manageStatus'),'导入失败：备份文件格式不正确。',true)}};
   $('#listBtn').onclick=renderInventory;
   $('#refreshBatchBtn').onclick=renderBatches;

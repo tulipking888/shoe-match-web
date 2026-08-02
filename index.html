@@ -11,8 +11,8 @@
 </head>
 <body>
   <header class="topbar">
-    <div><h1>AI 样品识别系统</h1><p>Excel 批量入库 · 图片检索 · Top 5</p></div>
-    <span id="dbCount" class="badge">0 条</span>
+    <div><h1>AI 样品识别系统</h1><p>Excel 批量入库 · DINOv2 视觉检索 · Top 5</p></div>
+    <div class="topbar-badges"><span id="modelStatus" class="model-badge" data-state="idle">AI 模型按需加载</span><span id="dbCount" class="badge">0 条</span></div>
   </header>
 
   <main>
@@ -25,7 +25,7 @@
     <section id="search" class="panel active">
       <div class="card hero-card">
         <h2>拍照或上传图片识别</h2>
-        <p>查询照尽量与样品照角度接近，主体占满画面，背景保持简单。</p>
+        <p>查询照尽量与样品照角度接近，主体占满画面，背景保持简单。首次使用会加载并缓存本地 AI 模型。</p>
         <div class="action-stack">
           <label class="primary-btn file-btn"><input id="queryCameraInput" type="file" accept="image/*" capture="environment" />手机拍照识别</label>
           <label class="secondary-btn file-btn"><input id="queryFileInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" />从相册或文件选择</label>
@@ -40,11 +40,11 @@
     <section id="add" class="panel">
       <form id="addForm" class="card form-card">
         <h2>单条样品入库</h2>
-        <p>样品编号允许重复，每次保存都会生成一条独立记录。</p>
+        <p>样品编号允许重复；同编号可录入多个角度，查询结果会自动合并。</p>
         <label>样品编号<input id="shoeCode" required maxlength="100" placeholder="例如：275008" /></label>
         <label class="secondary-btn file-btn"><input id="stockInput" type="file" accept="image/*" capture="environment" required />拍摄或选择样品照</label>
         <img id="stockPreview" class="preview hidden" alt="样品照片预览" />
-        <button id="saveBtn" class="primary-btn" type="submit">计算特征并保存</button>
+        <button id="saveBtn" class="primary-btn" type="submit">计算 AI 向量并保存</button>
         <div id="addStatus" class="status"></div>
       </form>
     </section>
@@ -52,7 +52,7 @@
     <section id="manage" class="panel">
       <div class="card">
         <h2>Excel 批量导入</h2>
-        <p>可直接导入完整 Excel。每次导入形成独立批次；相同样品编号全部保留。发现脏数据时，可在下方删除该批次后重新导入。</p>
+        <p>可直接导入完整 Excel 并在本机计算 AI 向量。每次导入形成独立批次；相同样品编号全部保留。旧版数据需要清空后重新导入。</p>
         <label class="primary-btn file-btn"><input id="excelInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />选择 Excel 文件</label>
         <div id="excelFileName" class="file-name"></div>
         <button id="excelImportBtn" class="secondary-btn" disabled>开始导入</button>
@@ -87,14 +87,15 @@
       <div class="result-info">
         <h3 class="result-code"></h3>
         <div class="meta-list"></div>
-        <div class="score-row"><span>相似度</span><strong class="result-score"></strong></div>
+        <div class="score-row"><span>匹配得分</span><strong class="result-score"></strong></div>
         <div class="score-bar"><i></i></div>
       </div>
     </article>
   </template>
 
   <script src="jszip.min.js"></script>
+  <script src="vendor/onnxruntime/ort.min.js"></script>
   <script src="app.js"></script>
-<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V3.1.1</div>
+<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V4.0.0 · DINOv2 本地视觉向量</div>
 </body>
 </html>

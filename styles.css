@@ -6,3 +6,4 @@
 .image-modal img{max-width:95vw;max-height:90vh;border-radius:12px;background:#fff}
 .image-modal button{position:absolute;top:20px;right:20px;width:42px;height:42px;border:0;border-radius:50%;font-size:28px;background:#fff;z-index:101}
 .result-img{cursor:pointer}
+.topbar-badges{display:flex;align-items:flex-end;gap:7px;flex-direction:column}.model-badge{font-size:11px;border-radius:999px;padding:5px 9px;background:#e2e8f0;color:#475569;white-space:nowrap}.model-badge[data-state="loading"]{background:#fef3c7;color:#92400e}.model-badge[data-state="ready"]{background:#dcfce7;color:#166534}.model-badge[data-state="warning"],.model-badge[data-state="error"]{background:#fee2e2;color:#991b1b}

@@ -1,5 +1,10 @@
-const CACHE = 'ai-sample-match-V3.1.1';
-const ASSETS = ['./','./index.html','./styles.css','./app.js','./jszip.min.js','./manifest.webmanifest'];
+const CACHE = 'ai-sample-match-V4.0.0';
+const ASSETS = [
+  './','./index.html','./styles.css','./app.js','./jszip.min.js','./manifest.webmanifest','./version.js',
+  './vendor/onnxruntime/ort.min.js','./vendor/onnxruntime/ort-wasm-simd-threaded.mjs','./vendor/onnxruntime/ort-wasm-simd-threaded.wasm',
+  './vendor/onnxruntime/ort-wasm-simd-threaded.jsep.mjs','./vendor/onnxruntime/ort-wasm-simd-threaded.jsep.wasm',
+  './models/dinov2-small/model_quantized.onnx'
+];
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch', event => {
