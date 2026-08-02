@@ -1,4 +1,4 @@
-const CACHE = 'ai-sample-match-V4.0.0';
+const CACHE = 'ai-sample-match-V5.0.0';
 const ASSETS = [
   './','./index.html','./styles.css','./app.js','./jszip.min.js','./manifest.webmanifest','./version.js',
   './vendor/onnxruntime/ort.min.js','./vendor/onnxruntime/ort-wasm-simd-threaded.mjs','./vendor/onnxruntime/ort-wasm-simd-threaded.wasm',

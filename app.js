@@ -1,14 +1,18 @@
 'use strict';
 
 const DB_NAME = 'shoe-match-db';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const SAMPLE_STORE = 'shoes';
 const BATCH_STORE = 'importBatches';
-const FEATURE_VERSION = 'dinov2-small-int8-cls-v1';
+const FEATURE_VERSION = 'dinov2-small-cls-local-color-v2';
 const MODEL_URL = './models/dinov2-small/model_quantized.onnx';
 const MODEL_DIMENSION = 384;
 const MODEL_INPUT_SIZE = 224;
 const MODEL_RESIZE_SHORT = 256;
+const LOCAL_GRID = 4;
+const LOCAL_REGIONS = LOCAL_GRID * LOCAL_GRID;
+const LOCAL_FEATURE_LENGTH = LOCAL_REGIONS * MODEL_DIMENSION;
+const COLOR_FEATURE_LENGTH = 89;
 let db;
 let stockFile = null;
 let excelFile = null;
@@ -96,40 +100,91 @@ async function ensureModel(statusEl){
     .catch(error=>{modelSessionPromise=null;setModelStatus('AI 模型加载失败','error');throw error});
   return modelSessionPromise;
 }
-function modelInputFromImage(img){
+function modelCanvas(img,mode='center',turns=0){
   const canvas=document.createElement('canvas');canvas.width=canvas.height=MODEL_INPUT_SIZE;
-  const ctx=canvas.getContext('2d',{willReadFrequently:true});
-  ctx.fillStyle='#fff';ctx.fillRect(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE);
-  const scale=MODEL_RESIZE_SHORT/Math.min(img.width,img.height),w=img.width*scale,h=img.height*scale;
-  ctx.drawImage(img,(MODEL_INPUT_SIZE-w)/2,(MODEL_INPUT_SIZE-h)/2,w,h);
-  const rgba=ctx.getImageData(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE).data;
-  const plane=MODEL_INPUT_SIZE*MODEL_INPUT_SIZE,input=new Float32Array(plane*3);
-  const means=[.485,.456,.406],stds=[.229,.224,.225];
-  for(let p=0,i=0;i<plane;i++,p+=4){input[i]=(rgba[p]/255-means[0])/stds[0];input[plane+i]=(rgba[p+1]/255-means[1])/stds[1];input[plane*2+i]=(rgba[p+2]/255-means[2])/stds[2]}
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.fillStyle='#fff';ctx.fillRect(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE);
+  const rotated=turns%2!==0,rw=rotated?img.height:img.width,rh=rotated?img.width:img.height;
+  const scale=mode==='letterbox'?MODEL_INPUT_SIZE/Math.max(rw,rh):MODEL_RESIZE_SHORT/Math.min(rw,rh);
+  ctx.translate(MODEL_INPUT_SIZE/2,MODEL_INPUT_SIZE/2);ctx.rotate(turns*Math.PI/2);
+  ctx.drawImage(img,-img.width*scale/2,-img.height*scale/2,img.width*scale,img.height*scale);
+  return canvas;
+}
+function inputFromCanvases(canvases){
+  const plane=MODEL_INPUT_SIZE*MODEL_INPUT_SIZE,input=new Float32Array(canvases.length*plane*3),means=[.485,.456,.406],stds=[.229,.224,.225];
+  canvases.forEach((canvas,b)=>{const rgba=canvas.getContext('2d',{willReadFrequently:true}).getImageData(0,0,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE).data,base=b*plane*3;for(let p=0,i=0;i<plane;i++,p+=4){input[base+i]=(rgba[p]/255-means[0])/stds[0];input[base+plane+i]=(rgba[p+1]/255-means[1])/stds[1];input[base+plane*2+i]=(rgba[p+2]/255-means[2])/stds[2]}});
   return input;
 }
-async function embeddingFromImage(img,statusEl){
-  const session=await ensureModel(statusEl),input=modelInputFromImage(img);
-  const outputs=await session.run({pixel_values:new ort.Tensor('float32',input,[1,3,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE])});
-  const tensor=outputs.last_hidden_state||Object.values(outputs)[0];
-  if(!tensor||tensor.data.length<MODEL_DIMENSION)throw Error('AI 模型输出格式不正确');
-  const embedding=new Array(MODEL_DIMENSION);let norm=0;
-  for(let i=0;i<MODEL_DIMENSION;i++){const v=Number(tensor.data[i]);embedding[i]=v;norm+=v*v}
-  norm=Math.sqrt(norm)||1;
-  for(let i=0;i<MODEL_DIMENSION;i++)embedding[i]/=norm;
-  return embedding;
+function normalizeVector(values){let norm=0;for(const v of values)norm+=v*v;norm=Math.sqrt(norm)||1;for(let i=0;i<values.length;i++)values[i]/=norm;return values}
+function pooledLocalFeatures(data,batchIndex,stride,quantize=false){
+  const out=quantize?new Int8Array(LOCAL_FEATURE_LENGTH):new Float32Array(LOCAL_FEATURE_LENGTH),batchBase=batchIndex*stride;
+  for(let gy=0;gy<LOCAL_GRID;gy++)for(let gx=0;gx<LOCAL_GRID;gx++){
+    const region=gy*LOCAL_GRID+gx,vec=new Float32Array(MODEL_DIMENSION);
+    for(let py=gy*4;py<gy*4+4;py++)for(let px=gx*4;px<gx*4+4;px++){const tokenBase=batchBase+(1+py*16+px)*MODEL_DIMENSION;for(let d=0;d<MODEL_DIMENSION;d++)vec[d]+=Number(data[tokenBase+d])}
+    normalizeVector(vec);const base=region*MODEL_DIMENSION;for(let d=0;d<MODEL_DIMENSION;d++)out[base+d]=quantize?Math.max(-127,Math.min(127,Math.round(vec[d]*127))):vec[d];
+  }
+  return out;
+}
+async function modelFeatures(canvases,statusEl,{quantizeLocal=false}={}){
+  const session=await ensureModel(statusEl),input=inputFromCanvases(canvases),batch=canvases.length;
+  const outputs=await session.run({pixel_values:new ort.Tensor('float32',input,[batch,3,MODEL_INPUT_SIZE,MODEL_INPUT_SIZE])}),tensor=outputs.last_hidden_state||Object.values(outputs)[0];
+  if(!tensor||tensor.data.length<batch*MODEL_DIMENSION)throw Error('AI 模型输出格式不正确');
+  const stride=tensor.data.length/batch,embeddings=[],locals=[];
+  for(let b=0;b<batch;b++){const embedding=new Float32Array(MODEL_DIMENSION);for(let i=0;i<MODEL_DIMENSION;i++)embedding[i]=Number(tensor.data[b*stride+i]);normalizeVector(embedding);embeddings.push(Array.from(embedding));locals.push(pooledLocalFeatures(tensor.data,b,stride,quantizeLocal))}
+  return {embeddings,locals};
+}
+function percentile(values,p){if(!values.length)return 0;values.sort((a,b)=>a-b);return values[Math.min(values.length-1,Math.max(0,Math.round((values.length-1)*p)))]}
+function median(values){return percentile(values,.5)}
+function rgbLabHsv(r8,g8,b8){
+  const r0=r8/255,g0=g8/255,b0=b8/255,lin=x=>x<=.04045?x/12.92:Math.pow((x+.055)/1.055,2.4),r=lin(r0),g=lin(g0),b=lin(b0);
+  const x=(.4124564*r+.3575761*g+.1804375*b)/.95047,y=.2126729*r+.7151522*g+.072175*b,z=(.0193339*r+.119192*g+.9503041*b)/1.08883,f=t=>t>.008856?Math.cbrt(t):7.787*t+16/116;
+  const fy=f(y),lab=[(116*fy-16)*2.55,500*(f(x)-fy)+128,200*(fy-f(z))+128],max=Math.max(r0,g0,b0),min=Math.min(r0,g0,b0),delta=max-min;
+  let hue=0;if(delta){if(max===r0)hue=60*((g0-b0)/delta%6);else if(max===g0)hue=60*((b0-r0)/delta+2);else hue=60*((r0-g0)/delta+4);if(hue<0)hue+=360}
+  return {lab,h:hue/2,s:max?delta/max:0,v:max};
+}
+function morph(mask,w,h,dilate){const out=new Uint8Array(mask.length);for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){let value=dilate?0:1;for(let yy=y-1;yy<=y+1;yy++)for(let xx=x-1;xx<=x+1;xx++)value=dilate?(value||mask[yy*w+xx]):(value&&mask[yy*w+xx]);out[y*w+x]=value?1:0}return out}
+function colorDescriptor(img){
+  const scale=Math.min(1,320/Math.max(img.width,img.height)),w=Math.max(1,Math.round(img.width*scale)),h=Math.max(1,Math.round(img.height*scale)),canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(img,0,0,w,h);
+  const rgba=ctx.getImageData(0,0,w,h).data,n=w*h,labs=new Float32Array(n*3),hs=new Float32Array(n),ss=new Float32Array(n),vs=new Float32Array(n),bw=Math.max(2,Math.round(Math.min(w,h)*.04)),border=[];
+  for(let i=0,p=0;i<n;i++,p+=4){const c=rgbLabHsv(rgba[p],rgba[p+1],rgba[p+2]);labs[i*3]=c.lab[0];labs[i*3+1]=c.lab[1];labs[i*3+2]=c.lab[2];hs[i]=c.h;ss[i]=c.s;vs[i]=c.v;const x=i%w,y=Math.floor(i/w);if(x<bw||x>=w-bw||y<bw||y>=h-bw)border.push(i)}
+  const bg=[0,1,2].map(ch=>median(border.map(i=>labs[i*3+ch]))),bgSat=median(border.map(i=>ss[i])),dist=new Float32Array(n),borderDist=[];
+  for(let i=0;i<n;i++){const a=labs[i*3]-bg[0],b=labs[i*3+1]-bg[1],c=labs[i*3+2]-bg[2];dist[i]=Math.sqrt(a*a+b*b+c*c);if((i%w)<bw||(i%w)>=w-bw||i<w*bw||i>=w*(h-bw))borderDist.push(dist[i])}
+  const threshold=Math.max(18,percentile(borderDist,.92)+8);let mask=new Uint8Array(n);for(let i=0;i<n;i++)mask[i]=(dist[i]>threshold||(ss[i]>bgSat+.10&&dist[i]>10)||vs[i]<bg[0]/255-.16)?1:0;
+  mask=morph(morph(mask,w,h,false),w,h,true);for(let k=0;k<3;k++)mask=morph(mask,w,h,true);for(let k=0;k<3;k++)mask=morph(mask,w,h,false);
+  const labels=new Int32Array(n),queue=new Int32Array(n),components=[];let label=0;
+  for(let start=0;start<n;start++){if(!mask[start]||labels[start])continue;label++;let head=0,tail=0,area=0,sx=0,sy=0;queue[tail++]=start;labels[start]=label;while(head<tail){const i=queue[head++],x=i%w,y=Math.floor(i/w);area++;sx+=x;sy+=y;for(const j of [i-1,i+1,i-w,i+w])if(j>=0&&j<n&&mask[j]&&!labels[j]&&Math.abs((j%w)-x)<=1){labels[j]=label;queue[tail++]=j}}const cx=sx/area,cy=sy/area,central=Math.max(0,1-1.3*Math.hypot((cx-w/2)/w,(cy-h/2)/h));components.push({label,area,score:area*(.35+central)})}
+  components.sort((a,b)=>b.score-a.score);const keep=new Set(components.slice(0,2).filter(x=>x.area>.002*n).map(x=>x.label)),selected=[];for(let i=0;i<n;i++)if(keep.has(labels[i])&&dist[i]>Math.max(8,threshold*.45))selected.push(i);
+  if(selected.length<100){const fallback=[...dist].sort((a,b)=>a-b)[Math.floor(n*.75)];selected.length=0;for(let i=0;i<n;i++)if(dist[i]>fallback)selected.push(i)}
+  const parts=[],hist=(bins,min,max,value,weight)=>{const out=new Float32Array(bins);for(const i of selected){const v=value(i),slot=Math.max(0,Math.min(bins-1,Math.floor((v-min)/(max-min)*bins)));out[slot]+=weight?weight(i):1}let sum=0;for(const v of out)sum+=v;for(const v of out)parts.push(Math.sqrt(v/(sum||1)))};
+  hist(18,0,180,i=>hs[i],i=>ss[i]*ss[i]+.05);hist(10,0,1,i=>ss[i]);hist(12,0,1,i=>vs[i]);hist(12,70,190,i=>labs[i*3+1]);hist(12,70,210,i=>labs[i*3+2]);
+  for(const getter of [i=>labs[i*3],i=>labs[i*3+1],i=>labs[i*3+2],i=>ss[i]*255,i=>vs[i]*255]){const values=selected.map(getter);for(const p of [.1,.25,.5,.75,.9])parts.push(percentile(values,p)/255)}
+  normalizeVector(parts);return {vector:parts,foregroundValue:median(selected.map(i=>vs[i]))};
 }
 function embeddingSimilarity(a,b){
   if(!a||!b||a.length!==MODEL_DIMENSION||b.length!==MODEL_DIMENSION)return -1;
   let dot=0;for(let i=0;i<MODEL_DIMENSION;i++)dot+=Number(a[i])*Number(b[i]);
   return Math.max(0,Math.min(1,dot));
 }
-async function featuresFromFile(file,statusEl){const img=await loadImage(file),embedding=await embeddingFromImage(img,statusEl);return {img,embedding,featureVersion:FEATURE_VERSION,thumb:makeThumb(img)}}
+function colorSimilarity(a,b){if(!a||!b||a.length!==COLOR_FEATURE_LENGTH||b.length!==COLOR_FEATURE_LENGTH)return 0;let dot=0;for(let i=0;i<a.length;i++)dot+=Number(a[i])*Number(b[i]);return Math.max(0,Math.min(1,dot))}
+function localSimilarity(queryLocals,gallery){
+  if(!gallery||gallery.length!==LOCAL_FEATURE_LENGTH)return 0;let best=-1;
+  for(const query of queryLocals){const rowBest=new Float32Array(LOCAL_REGIONS).fill(-1),colBest=new Float32Array(LOCAL_REGIONS).fill(-1);
+    for(let qr=0;qr<LOCAL_REGIONS;qr++)for(let gr=0;gr<LOCAL_REGIONS;gr++){let dot=0,qb=qr*MODEL_DIMENSION,gb=gr*MODEL_DIMENSION;for(let d=0;d<MODEL_DIMENSION;d++)dot+=query[qb+d]*gallery[gb+d]/127;if(dot>rowBest[qr])rowBest[qr]=dot;if(dot>colBest[gr])colBest[gr]=dot}
+    const topMean=values=>[...values].sort((a,b)=>b-a).slice(0,6).reduce((a,b)=>a+b,0)/6,score=(topMean(rowBest)+topMean(colBest))/2;if(score>best)best=score;
+  }
+  return Math.max(0,Math.min(1,best));
+}
+function familyKey(code){const text=String(code||'').trim().toLocaleLowerCase(),match=text.match(/^(\d+)/);return match?match[1]:text}
+function isWhiteVariant(code){return /(^|[\s._/-])white([\s._/-]|$)/i.test(String(code||''))}
+async function queryFeatures(img,statusEl){
+  const canvases=[];for(let turns=0;turns<4;turns++){canvases.push(modelCanvas(img,'center',turns),modelCanvas(img,'letterbox',turns))}
+  const model=await modelFeatures(canvases,statusEl),color=colorDescriptor(img);return {embeddings:model.embeddings,locals:model.locals,colorFeature:color.vector,foregroundValue:color.foregroundValue};
+}
+async function featuresFromFile(file,statusEl){const img=await loadImage(file),model=await modelFeatures([modelCanvas(img)],statusEl,{quantizeLocal:true}),color=colorDescriptor(img);return {img,embedding:model.embeddings[0],localFeatures:model.locals[0],colorFeature:color.vector,featureVersion:FEATURE_VERSION,thumb:makeThumb(img)}}
 function showPreview(file,el){el.src=URL.createObjectURL(file);el.classList.remove('hidden')}
 async function refreshCount(){
   const total=await countAll();$('#dbCount').textContent=`${total} 条`;
-  const all=total?await getAllSamples():[],searchable=all.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION).length;
-  if(searchable)setModelStatus(`AI 向量 ${searchable} 条`,'ready');
+  const all=total?await getAllSamples():[],searchable=all.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION&&x.localFeatures?.length===LOCAL_FEATURE_LENGTH&&x.colorFeature?.length===COLOR_FEATURE_LENGTH).length;
+  if(searchable)setModelStatus(`AI 特征 ${searchable} 条`,'ready');
   else if(total)setModelStatus('旧版数据需重新导入','warning');
   else setModelStatus('AI 模型按需加载','idle');
   await refreshStorage();
@@ -163,29 +218,34 @@ async function handleQuery(file){
   setStatus(status,'正在处理当前查询图片…');
   const start=performance.now();
   try{
-    const img=await loadImage(file),embedding=await embeddingFromImage(img,status);
+    const img=await loadImage(file),query=await queryFeatures(img,status);
     if(token!==queryToken)return;
-    const stored=await getAllSamples(),all=stored.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION);
+    const stored=await getAllSamples(),all=stored.filter(x=>x.featureVersion===FEATURE_VERSION&&x.embedding?.length===MODEL_DIMENSION&&x.localFeatures?.length===LOCAL_FEATURE_LENGTH&&x.colorFeature?.length===COLOR_FEATURE_LENGTH);
     if(!all.length){
       if(stored.length)throw Error('现有数据库是旧版特征，请在“批量与管理”中清空后重新导入 Excel');
       throw Error('数据库暂无样品，请先导入 Excel');
     }
-    setStatus(status,`正在比对 ${all.length} 条 AI 向量…`);
+    setStatus(status,`正在进行鞋型、局部细节与颜色比对（${all.length} 条）…`);
     await sleepFrame();
-    const bestByCode=new Map();
+    const samples=[],families=new Map();
     for(let i=0;i<all.length;i++){
       if(token!==queryToken)return;
-      const s=normalizedRecord(all[i]);
-      const item={...s,score:embeddingSimilarity(embedding,s.embedding)},key=s.code.trim().toLocaleLowerCase()||`__${s.id}`;
-      if(!bestByCode.has(key)||item.score>bestByCode.get(key).score)bestByCode.set(key,item);
+      const s=normalizedRecord(all[i]),global=Math.max(...query.embeddings.map(e=>embeddingSimilarity(e,s.embedding))),color=colorSimilarity(query.colorFeature,s.colorFeature),family=familyKey(s.code)||`__${s.id}`,item={record:s,global,color,family,local:0};samples.push(item);
+      const current=families.get(family)||{key:family,global:0,local:0,items:[]};current.global=Math.max(current.global,global);current.items.push(item);families.set(family,current);
       if(i&&i%300===0)await sleepFrame();
     }
-    const scored=[...bestByCode.values()];
+    const shortlist=[...families.values()].sort((a,b)=>b.global-a.global).slice(0,80),shortKeys=new Set(shortlist.map(x=>x.key));
+    setStatus(status,`已锁定 ${shortlist.length} 个鞋型，正在核对鞋底、拉链和饰条细节…`);await sleepFrame();
+    let checked=0;for(const item of samples)if(shortKeys.has(item.family)){item.local=localSimilarity(query.locals,item.record.localFeatures);const family=families.get(item.family);family.local=Math.max(family.local,item.local);if(++checked%20===0)await sleepFrame()}
+    const scored=[];for(const family of shortlist){family.score=.2*family.global+.8*(family.local||family.global);const variants=new Map();for(const item of family.items){const key=item.record.code.trim().toLocaleLowerCase()||`__${item.record.id}`,v=variants.get(key)||{code:key,global:0,color:0,items:[]};v.global=Math.max(v.global,item.global);v.color=Math.max(v.color,item.color);v.items.push(item);variants.set(key,v)}
+      let winner=null;for(const variant of variants.values()){variant.score=.7*variant.global+.3*variant.color;if(query.foregroundValue<.62&&isWhiteVariant(variant.code))variant.score-=.06;if(!winner||variant.score>winner.score)winner=variant}
+      const representative=winner.items.sort((a,b)=>(.7*b.global+.3*b.color)-(.7*a.global+.3*a.color))[0].record;scored.push({...representative,score:family.score,variantScore:winner.score});
+    }
     scored.sort((a,b)=>b.score-a.score);
     if(token!==queryToken)return;
     renderResults(scored.slice(0,5));
     const top=scored[0]?.code?`第一名：${scored[0].code}。`:'';
-    setStatus(status,`完成：比对 ${all.length} 条、合并为 ${scored.length} 个编号，耗时 ${Math.round(performance.now()-start)} ms。${top}`);
+    setStatus(status,`完成：比对 ${all.length} 条、合并为 ${families.size} 个鞋型，耗时 ${Math.round(performance.now()-start)} ms。${top}`);
   }catch(e){
     console.error(e);
     setStatus(status,e.message||'识别失败，请换一张图片重试。',true);
@@ -282,20 +342,20 @@ async function importExcel(file){
   let success=0,failed=0,total=0;const failures=[];
   let batch={batchId:id,fileName:file.name,fileSize:file.size,fingerprint,startedAt,status:'processing',totalCount:0,successCount:0,failedCount:0,failures:[]};await putBatch(batch);
   try{
-    await ensureModel(status);setStatus(status,'正在解析 Excel 并计算 AI 向量，请勿关闭页面…');
+    await ensureModel(status);setStatus(status,'正在解析 Excel 并计算 AI 鞋型、局部与颜色特征，请勿关闭页面…');
     const {zip,rows,names,imagesByRow}=await parseExcelPackage(file);const candidates=rows.filter(r=>String(pick(r,names,['样品编号','鞋子编号','编号'])).trim()||imagesByRow.has(r._row));total=candidates.length;batch.totalCount=total;await putBatch(batch);
     for(let i=0;i<candidates.length;i++){
       const r=candidates[i],code=String(pick(r,names,['样品编号','鞋子编号','编号'])).trim(),mediaPath=imagesByRow.get(r._row);
       try{
-        if(!code)throw Error('样品编号为空');if(!mediaPath)throw Error('缺少内嵌图片');const zf=zip.file(mediaPath);if(!zf)throw Error('找不到图片文件');const blob=await zf.async('blob');const {embedding,featureVersion,thumb}=await featuresFromFile(blob);
-        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,embedding,featureVersion,source:'excel',sourceFile:file.name,sourceRow:r._row,batchId:id,createdAt:Date.now()});success++;
+        if(!code)throw Error('样品编号为空');if(!mediaPath)throw Error('缺少内嵌图片');const zf=zip.file(mediaPath);if(!zf)throw Error('找不到图片文件');const blob=await zf.async('blob');const {embedding,localFeatures,colorFeature,featureVersion,thumb}=await featuresFromFile(blob);
+        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,embedding,localFeatures,colorFeature,featureVersion,source:'excel',sourceFile:file.name,sourceRow:r._row,batchId:id,createdAt:Date.now()});success++;
       }catch(e){failed++;failures.push({row:r._row,code,error:e.message||String(e)});console.warn('导入行失败',r._row,e)}
-      const pct=Math.round((i+1)/candidates.length*100);bar.style.width=`${pct}%`;txt.textContent=`${i+1} / ${candidates.length} · AI 向量成功 ${success} · 失败 ${failed}`;
+      const pct=Math.round((i+1)/candidates.length*100);bar.style.width=`${pct}%`;txt.textContent=`${i+1} / ${candidates.length} · AI 特征成功 ${success} · 失败 ${failed}`;
       if(i%3===0){await sleepFrame();await wait(5)}
       if(i%25===0){batch={...batch,totalCount:total,successCount:success,failedCount:failed,failures,status:'processing'};await putBatch(batch)}
     }
     batch={...batch,finishedAt:Date.now(),status:'completed',totalCount:total,successCount:success,failedCount:failed,failures};await putBatch(batch);
-    await refreshCount();await renderBatches();setStatus(status,`AI 向量导入完成：成功 ${success} 条，失败 ${failed} 条。相同编号会在查询结果中自动合并。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
+    await refreshCount();await renderBatches();setStatus(status,`AI 特征导入完成：成功 ${success} 条，失败 ${failed} 条。相同鞋型与配色会在查询结果中分层合并。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
   }catch(e){
     console.error(e);batch={...batch,finishedAt:Date.now(),status:'failed',totalCount:total,successCount:success,failedCount:failed||1,failures:[...failures,{row:null,error:e.message||'文件结构无法识别'}]};await putBatch(batch);await renderBatches();setStatus(status,`Excel 导入失败：${e.message||'文件结构无法识别'}`,true);
   }finally{btn.disabled=false}
@@ -316,7 +376,7 @@ async function importBackup(file){
   const data=JSON.parse(await file.text()),items=Array.isArray(data)?data:data.items;if(!Array.isArray(items))throw Error('bad');
   const id=batchId(),now=Date.now(),name=`备份导入：${file.name}`;let success=0;
   const t=db.transaction([SAMPLE_STORE,BATCH_STORE],'readwrite'),samples=t.objectStore(SAMPLE_STORE),batches=t.objectStore(BATCH_STORE);
-  items.forEach(x=>{const y=normalizedRecord(x);delete y.id;delete y.location;y.batchId=id;y.source='backup';y.sourceFile=file.name;samples.add(y);success++});
+  items.forEach(x=>{const y=normalizedRecord(x);delete y.id;delete y.location;if(y.localFeatures&&!ArrayBuffer.isView(y.localFeatures))y.localFeatures=Int8Array.from(Array.isArray(y.localFeatures)?y.localFeatures:Object.values(y.localFeatures));y.batchId=id;y.source='backup';y.sourceFile=file.name;samples.add(y);success++});
   batches.put({batchId:id,fileName:name,fileSize:file.size,fingerprint:fileFingerprint(file),startedAt:now,finishedAt:now,status:'completed',totalCount:items.length,successCount:success,failedCount:0,failures:[]});
   await new Promise((r,j)=>{t.oncomplete=r;t.onerror=()=>j(t.error)});return success;
 }
@@ -324,10 +384,10 @@ function initUI(){
   document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.tab,.panel').forEach(x=>x.classList.remove('active'));btn.classList.add('active');$('#'+btn.dataset.tab).classList.add('active');if(btn.dataset.tab==='manage')renderBatches()});
   bindQuery($('#queryCameraInput'));bindQuery($('#queryFileInput'));
   $('#stockInput').onchange=e=>{stockFile=e.target.files[0]||null;if(stockFile)showPreview(stockFile,$('#stockPreview'))};
-  $('#addForm').onsubmit=async e=>{e.preventDefault();if(!stockFile)return;const btn=$('#saveBtn'),status=$('#addStatus');btn.disabled=true;btn.textContent='正在计算 AI 向量…';try{const {embedding,featureVersion,thumb}=await featuresFromFile(stockFile,status);await addSample({code:$('#shoeCode').value.trim(),customerNo:'',orderNo:'',sendDate:'',remark:'',thumb,embedding,featureVersion,source:'manual',batchId:null,createdAt:Date.now()});setStatus(status,'保存成功；同编号的多张图片会在查询时自动合并。');e.target.reset();stockFile=null;$('#stockPreview').classList.add('hidden');await refreshCount()}catch(err){console.error(err);setStatus(status,`保存失败：${err.message||'浏览器存储空间不足'}`,true)}finally{btn.disabled=false;btn.textContent='计算 AI 向量并保存'}};
+  $('#addForm').onsubmit=async e=>{e.preventDefault();if(!stockFile)return;const btn=$('#saveBtn'),status=$('#addStatus');btn.disabled=true;btn.textContent='正在计算 AI 特征…';try{const {embedding,localFeatures,colorFeature,featureVersion,thumb}=await featuresFromFile(stockFile,status);await addSample({code:$('#shoeCode').value.trim(),customerNo:'',orderNo:'',sendDate:'',remark:'',thumb,embedding,localFeatures,colorFeature,featureVersion,source:'manual',batchId:null,createdAt:Date.now()});setStatus(status,'保存成功；同编号的多张图片会在查询时自动合并。');e.target.reset();stockFile=null;$('#stockPreview').classList.add('hidden');await refreshCount()}catch(err){console.error(err);setStatus(status,`保存失败：${err.message||'浏览器存储空间不足'}`,true)}finally{btn.disabled=false;btn.textContent='计算 AI 特征并保存'}};
   $('#excelInput').onchange=e=>{excelFile=e.target.files[0]||null;$('#excelFileName').textContent=excelFile?`${excelFile.name} · ${(excelFile.size/1024/1024).toFixed(1)} MB`:'';$('#excelImportBtn').disabled=!excelFile};
   $('#excelImportBtn').onclick=()=>excelFile&&importExcel(excelFile);
-  $('#exportBtn').onclick=async()=>{const all=await getAllSamples(),batches=await getAllBatches();downloadJSON(`sample-backup-${new Date().toISOString().slice(0,10)}.json`,{version:4,featureVersion:FEATURE_VERSION,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出 ${all.length} 条样品、AI 向量及批次记录。`)};
+  $('#exportBtn').onclick=async()=>{const all=(await getAllSamples()).map(x=>({...x,localFeatures:x.localFeatures?Array.from(x.localFeatures):null})),batches=await getAllBatches();downloadJSON(`sample-backup-${new Date().toISOString().slice(0,10)}.json`,{version:5,featureVersion:FEATURE_VERSION,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出 ${all.length} 条样品、AI 特征及批次记录。`)};
   $('#importInput').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const count=await importBackup(f);await refreshCount();await renderBatches();setStatus($('#manageStatus'),`成功导入 ${count} 条备份数据。`)}catch(err){console.error(err);setStatus($('#manageStatus'),'导入失败：备份文件格式不正确。',true)}};
   $('#listBtn').onclick=renderInventory;
   $('#refreshBatchBtn').onclick=renderBatches;
