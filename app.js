@@ -247,7 +247,17 @@ async function importExcel(file){
   }finally{btn.disabled=false}
 }
 
-function bindQuery(input){input.onchange=e=>{const f=e.target.files[0];if(f){showPreview(f,$('#queryPreview'));handleQuery(f)}}}
+function bindQuery(input){
+  if(!input)return;
+  input.onchange=e=>{
+    const f=e.target.files[0];
+    if(!f)return;
+    showPreview(f,$('#queryPreview'));
+    handleQuery(f);
+    // 允许再次选择同一张图片
+    input.value='';
+  };
+}
 async function importBackup(file){
   const data=JSON.parse(await file.text()),items=Array.isArray(data)?data:data.items;if(!Array.isArray(items))throw Error('bad');
   const id=batchId(),now=Date.now(),name=`备份导入：${file.name}`;let success=0;
@@ -271,14 +281,11 @@ function initUI(){
 }
 (async()=>{if(!('indexedDB'in window)){alert('当前浏览器不支持本地数据库，请使用最新版 Chrome、Edge 或 Safari。');return}db=await openDB();initUI();await refreshCount();await renderBatches();if('serviceWorker'in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(console.warn)})();
 
-\n// V3.1 图片预览与文件切换优化
+// V3.1 图片预览与文件切换优化
 document.addEventListener('click',e=>{
   if(e.target.id==='imageModal'||e.target.id==='modalClose') closeImageModal();
 });
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape') closeImageModal();
 });
-['queryFileInput','queryCameraInput'].forEach(id=>{
-  const el=document.getElementById(id);
-  if(el) el.addEventListener('change',()=>{ if(el.files[0]) showPreview(el.files[0],document.getElementById('queryPreview')); });
-});
+// 查询图片预览由 bindQuery 统一处理，避免重复绑定 change 事件。
