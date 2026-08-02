@@ -4,35 +4,32 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#111827" />
-  <title>鞋库拍照匹配</title>
+  <title>AI 样品识别系统</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <h1>鞋库拍照匹配</h1>
-      <p>纯前端 · 本机存储 · Top 5</p>
-    </div>
-    <span id="dbCount" class="badge">0 双</span>
+    <div><h1>AI 样品识别系统</h1><p>Excel 批量入库 · 图片检索 · Top 5</p></div>
+    <span id="dbCount" class="badge">0 条</span>
   </header>
 
   <main>
     <nav class="tabs" aria-label="功能切换">
-      <button class="tab active" data-tab="search">拍照查鞋</button>
-      <button class="tab" data-tab="add">鞋款入库</button>
-      <button class="tab" data-tab="manage">数据管理</button>
+      <button class="tab active" data-tab="search">图片识别</button>
+      <button class="tab" data-tab="add">单条入库</button>
+      <button class="tab" data-tab="manage">批量与管理</button>
     </nav>
 
     <section id="search" class="panel active">
       <div class="card hero-card">
-        <h2>拍照或选择鞋子照片</h2>
-        <p>建议与库存照角度接近，鞋子尽量占满画面，背景保持简单。</p>
-        <label class="primary-btn file-btn">
-          <input id="queryInput" type="file" accept="image/*" capture="environment" />
-          拍照查询
-        </label>
-        <img id="queryPreview" class="preview hidden" alt="查询照片预览" />
+        <h2>拍照或上传图片识别</h2>
+        <p>查询照尽量与样品照角度接近，主体占满画面，背景保持简单。</p>
+        <div class="action-stack">
+          <label class="primary-btn file-btn"><input id="queryCameraInput" type="file" accept="image/*" capture="environment" />手机拍照识别</label>
+          <label class="secondary-btn file-btn"><input id="queryFileInput" type="file" accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp" />从相册或文件选择</label>
+        </div>
+        <img id="queryPreview" class="preview hidden" alt="查询图片预览" />
         <div id="queryStatus" class="status"></div>
       </div>
       <div id="results" class="results"></div>
@@ -40,31 +37,41 @@
 
     <section id="add" class="panel">
       <form id="addForm" class="card form-card">
-        <h2>单双入库</h2>
-        <label>鞋子编号<input id="shoeCode" required maxlength="80" placeholder="例如：A-00125" /></label>
-        <label>存放位置<input id="shoeLocation" required maxlength="120" placeholder="例如：3号仓-B区-12架" /></label>
-        <label class="secondary-btn file-btn">
-          <input id="stockInput" type="file" accept="image/*" capture="environment" required />
-          拍摄库存照
-        </label>
-        <img id="stockPreview" class="preview hidden" alt="库存照片预览" />
-        <button id="saveBtn" class="primary-btn" type="submit">计算指纹并保存</button>
+        <h2>单条样品入库</h2>
+        <p>样品编号允许重复，每次保存都会生成一条独立记录。</p>
+        <label>样品编号<input id="shoeCode" required maxlength="100" placeholder="例如：275008" /></label>
+        <label class="secondary-btn file-btn"><input id="stockInput" type="file" accept="image/*" capture="environment" required />拍摄或选择样品照</label>
+        <img id="stockPreview" class="preview hidden" alt="样品照片预览" />
+        <button id="saveBtn" class="primary-btn" type="submit">计算特征并保存</button>
         <div id="addStatus" class="status"></div>
       </form>
     </section>
 
     <section id="manage" class="panel">
       <div class="card">
+        <h2>Excel 批量导入</h2>
+        <p>可直接导入完整 Excel。每次导入形成独立批次；相同样品编号全部保留。发现脏数据时，可在下方删除该批次后重新导入。</p>
+        <label class="primary-btn file-btn"><input id="excelInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />选择 Excel 文件</label>
+        <div id="excelFileName" class="file-name"></div>
+        <button id="excelImportBtn" class="secondary-btn" disabled>开始导入</button>
+        <div id="excelProgressWrap" class="progress-wrap hidden"><div class="progress-track"><i id="excelProgressBar"></i></div><div id="excelProgressText" class="progress-text"></div></div>
+        <div id="excelStatus" class="status"></div>
+      </div>
+
+      <div class="card">
+        <div class="section-head"><div><h2>导入批次</h2><p>删除批次只删除该次导入的样品，导入时间、文件名和结果仍保留，便于内部追溯。</p></div><button id="refreshBatchBtn" class="mini-secondary">刷新</button></div>
+        <div id="batchList" class="batch-list"></div>
+      </div>
+
+      <div class="card">
         <h2>数据管理</h2>
-        <p>数据默认保存在当前浏览器。清理浏览器数据或更换手机前，请先导出备份。</p>
+        <p>数据保存在当前浏览器。清理浏览器数据或更换设备前，请先导出备份。</p>
+        <div id="storageUsage" class="storage-usage"></div>
         <div class="button-grid">
-          <button id="exportBtn" class="secondary-btn">导出备份</button>
-          <label class="secondary-btn file-btn">
-            <input id="importInput" type="file" accept="application/json,.json" />
-            导入备份
-          </label>
-          <button id="listBtn" class="secondary-btn">查看最近入库</button>
-          <button id="clearBtn" class="danger-btn">清空全部数据</button>
+          <button id="exportBtn" class="secondary-btn">导出完整备份</button>
+          <label class="secondary-btn file-btn"><input id="importInput" type="file" accept="application/json,.json" />导入备份</label>
+          <button id="listBtn" class="secondary-btn">查看最近记录</button>
+          <button id="clearBtn" class="danger-btn">清空全部样品</button>
         </div>
         <div id="manageStatus" class="status"></div>
       </div>
@@ -74,17 +81,17 @@
 
   <template id="resultTemplate">
     <article class="result-card">
-      <div class="rank"></div>
-      <img class="result-img" alt="库存照" />
+      <div class="rank"></div><img class="result-img" alt="样品照" />
       <div class="result-info">
         <h3 class="result-code"></h3>
-        <p class="result-location"></p>
+        <div class="meta-list"></div>
         <div class="score-row"><span>相似度</span><strong class="result-score"></strong></div>
         <div class="score-bar"><i></i></div>
       </div>
     </article>
   </template>
 
+  <script src="jszip.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
