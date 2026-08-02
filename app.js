@@ -7,6 +7,7 @@ const BATCH_STORE = 'importBatches';
 let db;
 let stockFile = null;
 let excelFile = null;
+let queryToken = 0;
 
 const $ = s => document.querySelector(s);
 const sleepFrame = () => new Promise(r => requestAnimationFrame(r));
@@ -100,19 +101,54 @@ function renderResults(items){
   const root=$('#results');root.innerHTML='';
   if(!items.length){root.innerHTML='<div class="empty">数据库暂无样品，请先导入 Excel 或单条入库。</div>';return}
   items.forEach((x,i)=>{
-    const n=$('#resultTemplate').content.cloneNode(true);n.querySelector('.rank').textContent=i+1;n.querySelector('.result-img').src=x.thumb;n.querySelector('.result-code').textContent=`样品编号：${x.code||'未填写'}`;
+    const n=$('#resultTemplate').content.cloneNode(true);n.querySelector('.rank').textContent=i+1;const resultImg=n.querySelector('.result-img');
+    resultImg.src=x.thumb;
+    resultImg.onclick=()=>openImageModal(x.thumb);n.querySelector('.result-code').textContent=`样品编号：${x.code||'未填写'}`;
     const meta=[];if(x.sendDate)meta.push(['寄出时间',x.sendDate]);if(x.customerNo)meta.push(['客户编号',x.customerNo]);if(x.orderNo)meta.push(['订单编号',x.orderNo]);if(x.remark)meta.push(['特别要求',x.remark]);
     n.querySelector('.meta-list').innerHTML=meta.length?meta.map(([k,v])=>`<p><b>${esc(k)}：</b>${esc(v)}</p>`).join(''):'<p class="muted">无其他资料</p>';
     const pct=Math.round(x.score*1000)/10;n.querySelector('.result-score').textContent=`${pct}%`;n.querySelector('.score-bar i').style.width=`${pct}%`;root.appendChild(n);
   });
 }
 async function handleQuery(file){
-  const status=$('#queryStatus');setStatus(status,'正在计算查询图片特征…');const start=performance.now();
-  try{const {features}=await featuresFromFile(file);const all=(await getAllSamples()).filter(x=>x.features);setStatus(status,`正在比对 ${all.length} 条记录…`);await sleepFrame();const scored=[];
-    for(let i=0;i<all.length;i++){const s=normalizedRecord(all[i]);scored.push({...s,score:similarity(features,s.features)});if(i&&i%300===0)await sleepFrame()}
-    scored.sort((a,b)=>b.score-a.score);renderResults(scored.slice(0,5));setStatus(status,`完成：比对 ${all.length} 条，耗时 ${Math.round(performance.now()-start)} ms。`);
-  }catch(e){console.error(e);setStatus(status,'识别失败，请换一张图片重试。',true)}
+  const token=++queryToken;
+  const status=$('#queryStatus');
+  const results=$('#results');
+  results.innerHTML='';
+  setStatus(status,'正在处理当前查询图片…');
+  const start=performance.now();
+  try{
+    const {features}=await featuresFromFile(file);
+    if(token!==queryToken)return;
+    const all=(await getAllSamples()).filter(x=>x.features);
+    setStatus(status,`正在比对 ${all.length} 条记录…`);
+    await sleepFrame();
+    const scored=[];
+    for(let i=0;i<all.length;i++){
+      if(token!==queryToken)return;
+      const s=normalizedRecord(all[i]);
+      scored.push({...s,score:similarity(features,s.features)});
+      if(i&&i%300===0)await sleepFrame();
+    }
+    scored.sort((a,b)=>b.score-a.score);
+    if(token!==queryToken)return;
+    renderResults(scored.slice(0,5));
+    setStatus(status,`完成：比对 ${all.length} 条，耗时 ${Math.round(performance.now()-start)} ms。`);
+  }catch(e){
+    console.error(e);
+    setStatus(status,'识别失败，请换一张图片重试。',true);
+  }
 }
+function openImageModal(src){
+  const m=$('#imageModal'),img=$('#modalImage');
+  if(!m||!img)return;
+  img.src=src;
+  m.classList.remove('hidden');
+}
+function closeImageModal(){
+  const m=$('#imageModal');
+  if(m)m.classList.add('hidden');
+}
+
 async function renderInventory(){
   const root=$('#inventoryList');root.innerHTML='';const all=(await getAllSamples()).map(normalizedRecord).sort((a,b)=>b.createdAt-a.createdAt).slice(0,100);
   if(!all.length){root.innerHTML='<div class="empty">暂无样品数据</div>';return}
@@ -234,3 +270,15 @@ function initUI(){
   $('#clearBtn').onclick=async()=>{const input=prompt('此操作会删除全部样品数据，但保留批次审计记录。\n请输入 DELETE 确认：');if(input!=='DELETE'){setStatus($('#manageStatus'),'已取消清空。');return}const samples=await getAllSamples();await clearSamples();const batches=await getAllBatches();for(const b of batches){if(b.status!=='deleted')await markBatchDeleted(b,samples.filter(x=>x.batchId===b.batchId).length)}await refreshCount();await renderBatches();$('#inventoryList').innerHTML='';setStatus($('#manageStatus'),`已清空 ${samples.length} 条样品，导入审计记录已保留。`)};
 }
 (async()=>{if(!('indexedDB'in window)){alert('当前浏览器不支持本地数据库，请使用最新版 Chrome、Edge 或 Safari。');return}db=await openDB();initUI();await refreshCount();await renderBatches();if('serviceWorker'in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(console.warn)})();
+
+\n// V3.1 图片预览与文件切换优化
+document.addEventListener('click',e=>{
+  if(e.target.id==='imageModal'||e.target.id==='modalClose') closeImageModal();
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape') closeImageModal();
+});
+['queryFileInput','queryCameraInput'].forEach(id=>{
+  const el=document.getElementById(id);
+  if(el) el.addEventListener('change',()=>{ if(el.files[0]) showPreview(el.files[0],document.getElementById('queryPreview')); });
+});
