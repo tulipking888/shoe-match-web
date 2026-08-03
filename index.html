@@ -61,17 +61,17 @@
       </div>
 
       <div class="card">
-        <div class="section-head"><div><h2>导入批次</h2><p>删除批次只删除该次导入的样品，导入时间、文件名和结果仍保留，便于内部追溯。</p></div><button id="refreshBatchBtn" class="mini-secondary">刷新</button></div>
+        <div class="section-head"><div><h2>导入批次</h2><p>“删除本批”先删除样品并保留历史；已删除的历史卡片可再用“删除记录”永久清除。</p></div><button id="refreshBatchBtn" class="mini-secondary">刷新</button></div>
         <div id="batchList" class="batch-list"></div>
       </div>
 
       <div class="card">
-        <h2>数据管理</h2>
-        <p>数据保存在当前浏览器。清理浏览器数据或更换设备前，请先导出备份。</p>
+        <h2>样品库备份与手机迁移</h2>
+        <p>数据保存在当前浏览器。电脑完成 Excel 导入后，可导出包含 AI 特征的数据包，再到手机导入，无需在手机重新处理 Excel。</p>
         <div id="storageUsage" class="storage-usage"></div>
         <div class="button-grid">
-          <button id="exportBtn" class="secondary-btn">导出完整备份</button>
-          <label class="secondary-btn file-btn"><input id="importInput" type="file" accept="application/json,.json" />导入备份</label>
+          <button id="exportBtn" class="secondary-btn">导出样品库数据包</button>
+          <label class="secondary-btn file-btn"><input id="importInput" type="file" accept="application/json,.json" />导入样品库数据包</label>
           <button id="listBtn" class="secondary-btn">查看最近记录</button>
           <button id="clearBtn" class="danger-btn">清空全部样品</button>
         </div>
@@ -96,6 +96,6 @@
   <script src="jszip.min.js"></script>
   <script src="vendor/onnxruntime/ort.min.js"></script>
   <script src="app.js"></script>
-<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V5.1.0 · 一行多图/鞋型/局部细节/颜色融合匹配</div>
+<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V5.2.0 · 一行多图/跨设备数据包/多特征匹配</div>
 </body>
 </html>

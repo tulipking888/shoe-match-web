@@ -318,6 +318,11 @@ async function removeBatch(batch){
   if(!confirm(`确定删除批次“${batch.fileName}”中的 ${batch.successCount||0} 条样品？\n\n该批次的导入审计记录会保留，样品数据将删除。`))return;
   const deleted=await deleteBatchData(batch.batchId);await markBatchDeleted(batch,deleted);await refreshCount();await renderBatches();await renderInventory();setStatus($('#manageStatus'),`已删除批次数据 ${deleted} 条，审计记录已保留。`);
 }
+async function removeDeletedBatchRecord(batch){
+  if(batch.status!=='deleted')return;
+  if(!confirm(`确定永久删除批次“${batch.fileName}”的历史记录？\n\n该批次的样品数据已经删除，此操作只清除历史卡片，且无法恢复。`))return;
+  await reqP(store(BATCH_STORE,'readwrite').delete(batch.batchId));await renderBatches();setStatus($('#manageStatus'),'已永久删除该批次的历史记录。');
+}
 async function renderBatches(){
   const root=$('#batchList');if(!root)return;root.innerHTML='';
   const batches=(await getAllBatches()).sort((a,b)=>b.startedAt-a.startedAt);
@@ -330,6 +335,7 @@ async function renderBatches(){
     const actions=card.querySelector('.batch-actions');
     if((b.failures||[]).length){const report=document.createElement('button');report.className='mini-secondary';report.textContent='下载报告';report.onclick=()=>downloadJSON(`导入报告-${b.fileName}-${b.batchId}.json`,b);actions.appendChild(report)}
     if(b.status!=='deleted'){const del=document.createElement('button');del.className='mini-danger';del.textContent='删除本批';del.onclick=()=>removeBatch(b);actions.appendChild(del)}
+    else{const purge=document.createElement('button');purge.className='mini-danger';purge.textContent='删除记录';purge.onclick=()=>removeDeletedBatchRecord(b);actions.appendChild(purge)}
     root.appendChild(card);
   }
 }
@@ -378,8 +384,9 @@ function bindQuery(input){
   };
 }
 async function importBackup(file){
-  const data=JSON.parse(await file.text()),items=Array.isArray(data)?data:data.items;if(!Array.isArray(items))throw Error('bad');
-  const id=batchId(),now=Date.now(),name=`备份导入：${file.name}`;let success=0;
+  const data=JSON.parse(await file.text()),items=Array.isArray(data)?data:data.items;if(!Array.isArray(items))throw Error('数据包格式不正确');
+  if(items.some(x=>x.featureVersion!==FEATURE_VERSION))throw Error('数据包版本与当前网页不兼容，请使用同版本数据包，或重新导入原始 Excel');
+  const id=batchId(),now=Date.now(),name=`数据包导入：${file.name}`;let success=0;
   const t=db.transaction([SAMPLE_STORE,BATCH_STORE],'readwrite'),samples=t.objectStore(SAMPLE_STORE),batches=t.objectStore(BATCH_STORE);
   items.forEach(x=>{const y=normalizedRecord(x);delete y.id;delete y.location;if(y.localFeatures&&!ArrayBuffer.isView(y.localFeatures))y.localFeatures=Int8Array.from(Array.isArray(y.localFeatures)?y.localFeatures:Object.values(y.localFeatures));y.batchId=id;y.source='backup';y.sourceFile=file.name;samples.add(y);success++});
   batches.put({batchId:id,fileName:name,fileSize:file.size,fingerprint:fileFingerprint(file),startedAt:now,finishedAt:now,status:'completed',totalCount:items.length,successCount:success,failedCount:0,failures:[]});
@@ -392,8 +399,8 @@ function initUI(){
   $('#addForm').onsubmit=async e=>{e.preventDefault();if(!stockFile)return;const btn=$('#saveBtn'),status=$('#addStatus');btn.disabled=true;btn.textContent='正在计算 AI 特征…';try{const {embedding,localFeatures,colorFeature,featureVersion,thumb}=await featuresFromFile(stockFile,status);await addSample({code:$('#shoeCode').value.trim(),customerNo:'',orderNo:'',sendDate:'',remark:'',thumb,embedding,localFeatures,colorFeature,featureVersion,source:'manual',batchId:null,createdAt:Date.now()});setStatus(status,'保存成功；同编号的多张图片会在查询时自动合并。');e.target.reset();stockFile=null;$('#stockPreview').classList.add('hidden');await refreshCount()}catch(err){console.error(err);setStatus(status,`保存失败：${err.message||'浏览器存储空间不足'}`,true)}finally{btn.disabled=false;btn.textContent='计算 AI 特征并保存'}};
   $('#excelInput').onchange=e=>{excelFile=e.target.files[0]||null;$('#excelFileName').textContent=excelFile?`${excelFile.name} · ${(excelFile.size/1024/1024).toFixed(1)} MB`:'';$('#excelImportBtn').disabled=!excelFile};
   $('#excelImportBtn').onclick=()=>excelFile&&importExcel(excelFile);
-  $('#exportBtn').onclick=async()=>{const all=(await getAllSamples()).map(x=>({...x,localFeatures:x.localFeatures?Array.from(x.localFeatures):null})),batches=await getAllBatches();downloadJSON(`sample-backup-${new Date().toISOString().slice(0,10)}.json`,{version:5,featureVersion:FEATURE_VERSION,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出 ${all.length} 条样品、AI 特征及批次记录。`)};
-  $('#importInput').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const count=await importBackup(f);await refreshCount();await renderBatches();setStatus($('#manageStatus'),`成功导入 ${count} 条备份数据。`)}catch(err){console.error(err);setStatus($('#manageStatus'),'导入失败：备份文件格式不正确。',true)}};
+  $('#exportBtn').onclick=async()=>{const all=(await getAllSamples()).map(x=>({...x,localFeatures:x.localFeatures?Array.from(x.localFeatures):null})),batches=await getAllBatches(),appVersion=window.APP_VERSION||'V5';downloadJSON(`shoe-library-data-${appVersion}-${new Date().toISOString().slice(0,10)}.json`,{version:5,appVersion,featureVersion:FEATURE_VERSION,exportedAt:Date.now(),items:all,batches});setStatus($('#manageStatus'),`已导出样品库数据包：${all.length} 条样品及其 AI 特征。`)};
+  $('#importInput').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const existing=await countAll();if(existing&&!confirm(`当前浏览器已有 ${existing} 条样品。继续导入会追加数据，可能产生重复记录。\n\n确定继续吗？`)){setStatus($('#manageStatus'),'已取消导入样品库数据包。');return}const count=await importBackup(f);await refreshCount();await renderBatches();setStatus($('#manageStatus'),`成功导入样品库数据包：${count} 条样品，无需重新计算 AI 特征。`)}catch(err){console.error(err);setStatus($('#manageStatus'),`导入失败：${err.message||'数据包格式不正确'}`,true)}finally{e.target.value=''}};
   $('#listBtn').onclick=renderInventory;
   $('#refreshBatchBtn').onclick=renderBatches;
   $('#clearBtn').onclick=async()=>{const input=prompt('此操作会删除全部样品数据，但保留批次审计记录。\n请输入 DELETE 确认：');if(input!=='DELETE'){setStatus($('#manageStatus'),'已取消清空。');return}const samples=await getAllSamples();await clearSamples();const batches=await getAllBatches();for(const b of batches){if(b.status!=='deleted')await markBatchDeleted(b,samples.filter(x=>x.batchId===b.batchId).length)}await refreshCount();await renderBatches();$('#inventoryList').innerHTML='';setStatus($('#manageStatus'),`已清空 ${samples.length} 条样品，导入审计记录已保留。`)};
