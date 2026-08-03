@@ -271,8 +271,9 @@ function downloadJSON(name,data){const a=document.createElement('a');a.href=URL.
 
 function xml(text){return new DOMParser().parseFromString(text,'application/xml')}
 function localChildren(node,name){return [...node.getElementsByTagNameNS('*',name)]}
-function pathJoin(base,target){const parts=(base+'/'+target).split('/'),out=[];for(const p of parts){if(!p||p==='.')continue;if(p==='..')out.pop();else out.push(p)}return out.join('/')}
+function pathJoin(base,target){const rooted=String(target).startsWith('/'),parts=((rooted?'':base)+'/'+target).split('/'),out=[];for(const p of parts){if(!p||p==='.')continue;if(p==='..')out.pop();else out.push(p)}return out.join('/')}
 function colToIndex(ref){let n=0;for(const ch of ref.match(/[A-Z]+/i)[0].toUpperCase())n=n*26+ch.charCodeAt(0)-64;return n-1}
+function indexToCol(index){let n=index+1,out='';while(n>0){n--;out=String.fromCharCode(65+n%26)+out;n=Math.floor(n/26)}return out}
 function excelDate(v){if(v===''||v==null)return '';const n=Number(v);if(!Number.isFinite(n))return String(v);const date=new Date(Date.UTC(1899,11,30)+n*86400000);return date.toISOString().slice(0,10)}
 async function parseExcelPackage(file){
   if(!window.JSZip)throw Error('Excel 解压组件未加载');
@@ -287,9 +288,11 @@ async function parseExcelPackage(file){
   const header=rows.shift()||{};const names={};Object.keys(header).filter(k=>!k.startsWith('_')).forEach(k=>names[String(header[k]).trim()]=Number(k));
   const sheetRelsPath=sheetPath.replace(/([^/]+)$/,'_rels/$1.rels');let drawingPath='xl/drawings/drawing1.xml';
   const sheetRelsFile=zip.file(sheetRelsPath);if(sheetRelsFile){const rd=xml(await sheetRelsFile.async('text'));const rel=localChildren(rd,'Relationship').find(r=>(r.getAttribute('Type')||'').endsWith('/drawing'));if(rel)drawingPath=pathJoin(sheetPath.split('/').slice(0,-1).join('/'),rel.getAttribute('Target'))}
+  const imageColumns=new Set(Object.entries(names).filter(([name])=>/^(图片|照片|图像)\s*\d*$/i.test(name)).map(([,index])=>index));
   const imagesByRow=new Map();const drawingFile=zip.file(drawingPath);
   if(drawingFile){const drawingDoc=xml(await drawingFile.async('text')),relsPath=drawingPath.replace(/([^/]+)$/,'_rels/$1.rels'),relsFile=zip.file(relsPath);if(relsFile){const relsDoc=xml(await relsFile.async('text')),relMap=new Map(localChildren(relsDoc,'Relationship').map(r=>[r.getAttribute('Id'),pathJoin(drawingPath.split('/').slice(0,-1).join('/'),r.getAttribute('Target'))]));
-      for(const anchor of [...drawingDoc.documentElement.children]){const from=[...anchor.children].find(n=>n.localName==='from'),pic=localChildren(anchor,'pic')[0];if(!from||!pic)continue;const row0=Number(localChildren(from,'row')[0]?.textContent),blip=localChildren(pic,'blip')[0],rid=blip?.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','embed')||blip?.getAttribute('r:embed');const mediaPath=relMap.get(rid);if(mediaPath&&!imagesByRow.has(row0+1))imagesByRow.set(row0+1,mediaPath)}
+      for(const anchor of [...drawingDoc.documentElement.children]){const from=[...anchor.children].find(n=>n.localName==='from'),pic=localChildren(anchor,'pic')[0];if(!from||!pic)continue;const row0=Number(localChildren(from,'row')[0]?.textContent),col0=Number(localChildren(from,'col')[0]?.textContent),blip=localChildren(pic,'blip')[0],rid=blip?.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','embed')||blip?.getAttribute('r:embed'),mediaPath=relMap.get(rid);if(!mediaPath||(imageColumns.size&&!imageColumns.has(col0)))continue;const rowImages=imagesByRow.get(row0+1)||[];rowImages.push({col:col0,mediaPath});imagesByRow.set(row0+1,rowImages)}
+      for(const rowImages of imagesByRow.values())rowImages.sort((a,b)=>a.col-b.col);
     }}
   return {zip,rows,names,imagesByRow};
 }
@@ -343,19 +346,21 @@ async function importExcel(file){
   let batch={batchId:id,fileName:file.name,fileSize:file.size,fingerprint,startedAt,status:'processing',totalCount:0,successCount:0,failedCount:0,failures:[]};await putBatch(batch);
   try{
     await ensureModel(status);setStatus(status,'正在解析 Excel 并计算 AI 鞋型、局部与颜色特征，请勿关闭页面…');
-    const {zip,rows,names,imagesByRow}=await parseExcelPackage(file);const candidates=rows.filter(r=>String(pick(r,names,['样品编号','鞋子编号','编号'])).trim()||imagesByRow.has(r._row));total=candidates.length;batch.totalCount=total;await putBatch(batch);
+    const {zip,rows,names,imagesByRow}=await parseExcelPackage(file),candidates=[];
+    for(const r of rows){const code=String(pick(r,names,['样品编号','鞋子编号','编号'])).trim(),rowImages=imagesByRow.get(r._row)||[];if(!code&&!rowImages.length)continue;if(rowImages.length){for(const image of rowImages)candidates.push({row:r,code,...image})}else candidates.push({row:r,code,col:null,mediaPath:null})}
+    total=candidates.length;batch.totalCount=total;await putBatch(batch);
     for(let i=0;i<candidates.length;i++){
-      const r=candidates[i],code=String(pick(r,names,['样品编号','鞋子编号','编号'])).trim(),mediaPath=imagesByRow.get(r._row);
+      const {row:r,code,col,mediaPath}=candidates[i],imageColumn=col==null?'':indexToCol(col);
       try{
         if(!code)throw Error('样品编号为空');if(!mediaPath)throw Error('缺少内嵌图片');const zf=zip.file(mediaPath);if(!zf)throw Error('找不到图片文件');const blob=await zf.async('blob');const {embedding,localFeatures,colorFeature,featureVersion,thumb}=await featuresFromFile(blob);
-        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,embedding,localFeatures,colorFeature,featureVersion,source:'excel',sourceFile:file.name,sourceRow:r._row,batchId:id,createdAt:Date.now()});success++;
-      }catch(e){failed++;failures.push({row:r._row,code,error:e.message||String(e)});console.warn('导入行失败',r._row,e)}
+        await addSample({code,sendDate:excelDate(pick(r,names,['样品寄出时间','寄出时间','日期'])),customerNo:String(pick(r,names,['客户编号','客户号'])).trim(),orderNo:String(pick(r,names,['订单编号','订单号'])).trim(),remark:String(pick(r,names,['特别要求','备注','要求'])).trim(),thumb,embedding,localFeatures,colorFeature,featureVersion,source:'excel',sourceFile:file.name,sourceRow:r._row,sourceImageColumn:imageColumn,batchId:id,createdAt:Date.now()});success++;
+      }catch(e){failed++;failures.push({row:r._row,column:imageColumn,code,error:e.message||String(e)});console.warn('导入图片失败',r._row,imageColumn,e)}
       const pct=Math.round((i+1)/candidates.length*100);bar.style.width=`${pct}%`;txt.textContent=`${i+1} / ${candidates.length} · AI 特征成功 ${success} · 失败 ${failed}`;
       if(i%3===0){await sleepFrame();await wait(5)}
       if(i%25===0){batch={...batch,totalCount:total,successCount:success,failedCount:failed,failures,status:'processing'};await putBatch(batch)}
     }
     batch={...batch,finishedAt:Date.now(),status:'completed',totalCount:total,successCount:success,failedCount:failed,failures};await putBatch(batch);
-    await refreshCount();await renderBatches();setStatus(status,`AI 特征导入完成：成功 ${success} 条，失败 ${failed} 条。相同鞋型与配色会在查询结果中分层合并。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
+    await refreshCount();await renderBatches();setStatus(status,`AI 特征导入完成：成功 ${success} 张，失败 ${failed} 张。同一编号的多张样品图会在查询结果中自动合并。${failed?'可在“导入批次”下载失败报告。':''}`,failed>0&&success===0);
   }catch(e){
     console.error(e);batch={...batch,finishedAt:Date.now(),status:'failed',totalCount:total,successCount:success,failedCount:failed||1,failures:[...failures,{row:null,error:e.message||'文件结构无法识别'}]};await putBatch(batch);await renderBatches();setStatus(status,`Excel 导入失败：${e.message||'文件结构无法识别'}`,true);
   }finally{btn.disabled=false}

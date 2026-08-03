@@ -52,7 +52,7 @@
     <section id="manage" class="panel">
       <div class="card">
         <h2>Excel 批量导入</h2>
-        <p>可直接导入完整 Excel 并在本机计算 AI 鞋型、局部与颜色特征。每次导入形成独立批次；相同样品编号全部保留。旧版数据需要清空后重新导入。</p>
+        <p>支持一行嵌入图片1、图片2、图片3，每张图独立计算 AI 鞋型、局部与颜色特征；旧版同编号重复多行仍兼容。V4 及更早数据需要清空后重新导入。</p>
         <label class="primary-btn file-btn"><input id="excelInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />选择 Excel 文件</label>
         <div id="excelFileName" class="file-name"></div>
         <button id="excelImportBtn" class="secondary-btn" disabled>开始导入</button>
@@ -96,6 +96,6 @@
   <script src="jszip.min.js"></script>
   <script src="vendor/onnxruntime/ort.min.js"></script>
   <script src="app.js"></script>
-<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V5.0.0 · 鞋型/局部细节/颜色融合匹配</div>
+<div id="app-version" style="font-size:12px;color:#64748b;text-align:center;margin:8px;">版本：V5.1.0 · 一行多图/鞋型/局部细节/颜色融合匹配</div>
 </body>
 </html>
